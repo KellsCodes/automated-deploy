@@ -85,10 +85,70 @@ echo "SSH Key Path:     $SSH_KEY_PATH"
 echo "App Port:         $APP_PORT"
 echo ""
 
-read -rp "Proceed with these settings? (y/n): " CONFIRM
-if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
-    log_info " Deployment aborted by user."
-    exit 0
+# read -rp "Proceed with these settings? (y/n): " CONFIRM
+# if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+#     log_info " Deployment aborted by user."
+#     exit 0
+# fi
+
+# =================================
+# Part 2: Setup and clone repository
+# =================================
+log_info " All parameters collected successfully"
+log_info " Starting repository setup..."
+
+REPO_NAME=$(basename -s .git "$GIT_REPO_URL")
+WORK_DIR="$HOME/deployment/$REPO_NAME"
+
+# Create deployment directory if not exists
+mkdir -p "$(dirname "$WORK_DIR")"
+
+# Authenticated URL (PAT safely embedded)
+AUTH_REPO_URL=$(echo "$GIT_REPO_URL" | sed "s#https://#https://$GIT_PAT:@#")
+if [[ -d "$WORK_DIR/.git" ]]; then
+    log_info " Repository already exists. Pulling latest changes..."
+    cd "$WORK_DIR"
+    git reset --hard
+    git clean -fd
+    git fetch origin "$GIT_BRANCH"
+    git checkout "$GIT_BRANCH"
+    git pull origin "$GIT_BRANCH" || {
+        log_error " Failed to pull latest changes from $GIT_BRANCH"
+        exit 1
+    }
+else
+    log_info " Cloning repository into $WORK_DIR..."
+    git clone --branch "$GIT_BRANCH" "$AUTH_REPO_URL" "$WORK_DIR" || {
+        log_error " Failed to clone repository. Please check your URL or PAT"
+        exit 1
+    }
+    cd "$WORK_DIR"
 fi
 
-log_info " All parameters collected successfully"
+log_info " Repository is ready at: $WORK_DIR"
+echo "......................................."
+
+# ==========================
+# Part 3: Verify Docker Setup
+# ==========================
+log_info " Navigating into the cloned directory"
+
+# Ensure work_dir is the correct directory
+cd "$WORK_DIR" || {
+    log_error " Failed to enter repository directory: $WORK_DIR"
+    exit 1
+}
+
+log_info " Checking Docker setup in repository..."
+
+# Check for Docker configuration  files
+if [[ -f "Dockerfile" ]]; then
+    log_info " Found Dockerfile - ready for Docker build."
+elif [[ -f "docker-compose.yml" ]]; then
+    log_info " Found docker-compose.yml - ready for multi-service deployment"
+else
+    log_error " No Dockerfile or docker-compose.yml found. Cannot continue deployment."
+    exit 1
+fi
+
+log_info " Docker Configuration verified successfully."
