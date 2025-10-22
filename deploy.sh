@@ -175,6 +175,52 @@ else
     echo "SSH connection verified successfully."
 fi
 
+
+# ==============================================================
+# PART 10 — IDEMPOTENCY & CLEANUP HANDLING(At THE BOTTOM SCRIPT)
+# ==============================================================
+
+# --- Define cleanup flag ---
+CLEANUP_MODE=false
+
+# Check if user passed the --cleanup flag when running script
+for arg in "$@"; do
+    if [[ "$arg" == "--cleanup" ]]; then
+        CLEANUP_MODE=true
+    fi
+done
+
+
+# --- Idempotent setup before new deployment ---
+log_info " Ensuring idempotency before redeployment..."
+
+ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" bash -s <<EOF
+    set -e
+
+    echo "Checking for existing containers on port $APP_PORT..."
+    EXISTING_CONTAINER=\$(sudo docker ps --filter "publish=$APP_PORT" --format "{{.ID}}")
+    if [[ -n "\$EXISTING_CONTAINER" ]]; then
+        echo "Stopping existing container using port $APP_PORT..."
+        sudo docker stop "\$EXISTING_CONTAINER" || true
+        sudo docker rm "\$EXISTING_CONTAINER" || true
+    fi
+
+    echo "Cleaning up old Docker networks..."
+    sudo docker network prune -f || true
+
+    echo "Ensuring Nginx config symlink is unique..."
+    sudo rm -f /etc/nginx/sites-enabled/app_proxy
+    sudo ln -sf /etc/nginx/sites-available/app_proxy /etc/nginx/sites-enabled/app_proxy || true
+EOF
+
+if [[ $? -eq 0 ]]; then
+    log_info " Idempotent checks completed. Safe to redeploy."
+else
+    log_error " Idempotent check failed during remote execution."
+    exit 1
+fi
+
+
 # ========================================================
 # Part 5 - PREPARE REMOTE ENVIRONMENT ---
 # ========================================================
@@ -276,7 +322,7 @@ if [[ $? -ne 0 ]]; then
     log_error "File transfer to remote server failed."
     exit 1
 else
-    log_info "✅ Project files transferred successfully."
+    log_info "Project files transferred successfully."
 fi
 
 # --- Step 2: Build and run containers remotely ---
@@ -289,38 +335,234 @@ cd $REMOTE_APP_DIR
 
 # --- Detect Docker configuration ---
 if [[ -f "docker-compose.yml" ]]; then
-    echo "🧩 docker-compose.yml found. Starting with Docker Compose..."
+    echo "docker-compose.yml found. Starting with Docker Compose..."
     sudo docker-compose pull
     sudo docker-compose build
     sudo docker-compose up -d
 elif [[ -f "Dockerfile" ]]; then
-    echo "🐳 Dockerfile found. Building and running manually..."
+    echo "Dockerfile found. Building and running manually..."
     APP_NAME=\$(basename \$(pwd))
     sudo docker build -t \$APP_NAME .
     sudo docker run -d -p $APP_PORT:$APP_PORT --name \$APP_NAME \$APP_NAME
 else
-    echo "❌ No Dockerfile or docker-compose.yml found in project directory."
+    echo "No Dockerfile or docker-compose.yml found in project directory."
     exit 1
 fi
 
 # --- Step 3: Validate container health ---
-echo "🔍 Checking running containers..."
+echo "Checking running containers..."
 sudo docker ps
 
 # --- Step 4: Verify app is accessible on the specified port ---
-echo "🌐 Validating application accessibility on port $APP_PORT..."
+echo "Validating application accessibility on port $APP_PORT..."
 sleep 5
 if curl -s "http://localhost:$APP_PORT" >/dev/null; then
-    echo "✅ Application is running and accessible on port $APP_PORT!"
+    echo "Application is running and accessible on port $APP_PORT!"
 else
-    echo "⚠️  Application did not respond on port $APP_PORT. Check container logs."
+    echo "Application did not respond on port $APP_PORT. Check container logs."
     sudo docker logs \$(sudo docker ps -q --latest)
 fi
 EOF
 
 if [[ $? -ne 0 ]]; then
-    log_error "Deployment failed on $SERVER_IP."
+    log_error " Deployment failed on $SERVER_IP."
     exit 1
 else
-    log_info "✅ Deployment completed successfully!"
+    log_info " Deployment completed successfully!"
+fi
+
+
+# =========================================
+# PART 7 — CONFIGURE NGINX AS REVERSE PROXY
+# =========================================
+
+log_info "Configuring Nginx as reverse proxy..."
+
+# Ensure DOMAIN_NAME exists (optional override)
+DOMAIN_NAME="${DOMAIN_NAME:-example.com}"
+
+# Create a temporary nginx config locally with correct escaping for nginx $-vars
+TMP_NGINX_CONF="$(mktemp /tmp/app_proxy.XXXXXX.conf)"
+
+cat > "$TMP_NGINX_CONF" <<EOF
+server {
+    listen 80;
+    server_name ${DOMAIN_NAME};
+
+    location / {
+        proxy_pass http://127.0.0.1:${APP_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+    }
+
+    access_log /var/log/nginx/app_access.log;
+    error_log /var/log/nginx/app_error.log;
+}
+
+# SSL placeholder (Certbot or self-signed)
+# server {
+#     listen 443 ssl;
+#     server_name ${DOMAIN_NAME};
+#     ssl_certificate /etc/ssl/certs/app.crt;
+#     ssl_certificate_key /etc/ssl/private/app.key;
+#     location / {
+#         proxy_pass http://127.0.0.1:${APP_PORT};
+#         proxy_set_header Host \$host;
+#     }
+# }
+EOF
+
+log_info "Uploading nginx config to remote host..."
+
+# Paths on remote
+NGINX_CONFIG_PATH="/etc/nginx/sites-available/app_proxy"
+NGINX_ENABLED_PATH="/etc/nginx/sites-enabled/app_proxy"
+
+# Copy config to remote /tmp then move with sudo to proper location to avoid permission issues
+scp -i "$SSH_KEY_PATH" "$TMP_NGINX_CONF" "$SSH_USER@$SERVER_IP:/tmp/app_proxy.conf" >/dev/null 2>&1 || {
+  log_error "Failed to upload nginx config to remote host."
+  rm -f "$TMP_NGINX_CONF"
+  exit 1
+}
+
+rm -f "$TMP_NGINX_CONF"
+
+# Apply config remotely: install nginx if missing, remove default, move config, enable, test, reload
+ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" bash -s <<'REMOTE_EOF'
+set -e
+
+NGINX_CONFIG_PATH="/etc/nginx/sites-available/app_proxy"
+NGINX_ENABLED_PATH="/etc/nginx/sites-enabled/app_proxy"
+
+# Install nginx if missing
+if ! command -v nginx &>/dev/null; then
+  echo "Installing nginx..."
+  sudo apt-get update -y
+  sudo apt-get install -y nginx
+fi
+
+# Remove default site if present
+if [ -f /etc/nginx/sites-enabled/default ]; then
+  echo "Removing default nginx site..."
+  sudo rm -f /etc/nginx/sites-enabled/default
+fi
+
+# Move uploaded config into place
+sudo mv /tmp/app_proxy.conf "$NGINX_CONFIG_PATH"
+sudo chown root:root "$NGINX_CONFIG_PATH"
+sudo chmod 644 "$NGINX_CONFIG_PATH"
+
+# Enable site (idempotent)
+sudo ln -sf "$NGINX_CONFIG_PATH" "$NGINX_ENABLED_PATH"
+
+# Test and reload
+if sudo nginx -t; then
+  echo "nginx config OK - reloading"
+  sudo systemctl reload nginx
+else
+  echo "nginx config test FAILED"
+  sudo nginx -t || true
+  exit 1
+fi
+
+echo "Nginx reverse proxy configured"
+REMOTE_EOF
+
+if [[ $? -eq 0 ]]; then
+  log_info " Nginx reverse proxy configured successfully!"
+  log_info "Access your app at: http://$SERVER_IP (or http://$DOMAIN_NAME)"
+else
+  log_error " Failed to configure Nginx reverse proxy."
+  exit 1
+fi
+
+
+
+# ===========================
+# PART 8: VALIDATE DEPLOYMENT
+# ===========================
+
+log_info " Validating deployment..."
+
+# 1. Check Docker service status
+if ssh -i "$SSH_KEY_PATH" "$SSH_USER@$SERVER_IP" "systemctl is-active --quiet docker"; then
+  log_info " Docker service is active."
+else
+  log_error " Docker service is not running!"
+  exit 1
+fi
+
+# 2. Verify running containers
+log_info "Checking for running containers..."
+ssh -i "$SSH_KEY_PATH" "$SSH_USER@$SERVER_IP" "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'" || {
+  log_error " Failed to list containers!"
+  exit 1
+}
+
+# 3. Confirm Nginx is active
+if ssh -i "$SSH_KEY_PATH" "$SSH_USER@$SERVER_IP" "systemctl is-active --quiet nginx"; then
+  log_info " Nginx service is active."
+else
+  log_error " Nginx service is not running!"
+  exit 1
+fi
+
+# 4. Test Nginx reverse proxy locally (inside EC2)
+log_info "Testing Nginx proxy locally..."
+ssh -i "$SSH_KEY_PATH" "$SSH_USER@$SERVER_IP" "curl -I http://localhost" || {
+  log_error " Local Nginx test failed!"
+  exit 1
+}
+
+# 5. Test app accessibility remotely (from your local machine)
+log_info "Testing app accessibility remotely..."
+if curl -I "http://$SERVER_IP" | grep -qE "200|301|302"; then
+  log_info " App is accessible via Nginx reverse proxy at http://$SERVER_IP"
+else
+  log_error " App is not accessible at http://$SERVER_IP. Check Nginx config or container port mapping."
+fi
+
+
+# --- Handle cleanup mode ---
+if [[ "$CLEANUP_MODE" == true ]]; then
+    log_info " Cleanup mode activated. Removing deployed resources from remote server..."
+
+    ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" bash -s <<EOF
+        set -e
+
+        echo "Stopping and removing Docker containers..."
+        if sudo docker ps -q | grep .; then
+            sudo docker stop \$(sudo docker ps -q)
+            sudo docker rm \$(sudo docker ps -a -q)
+        fi
+
+        echo "Removing all app-related Docker images..."
+        sudo docker image prune -af
+
+        echo "Removing old Docker networks if any..."
+        sudo docker network prune -f
+
+        echo "Removing Nginx configuration..."
+        sudo rm -f /etc/nginx/sites-available/app_proxy /etc/nginx/sites-enabled/app_proxy
+        sudo nginx -t && sudo systemctl reload nginx
+
+        echo "Removing application directory..."
+        rm -rf "/home/$SSH_USER/app"
+
+        echo "Cleanup complete!"
+EOF
+
+    if [[ $? -eq 0 ]]; then
+        log_info " Cleanup completed successfully."
+        exit 0
+    else
+        log_error " Cleanup failed during remote execution."
+        exit 1
+    fi
 fi
