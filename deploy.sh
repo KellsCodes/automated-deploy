@@ -18,7 +18,7 @@ log_info() {
 }
 
 log_error() {
-    echo -e "❌  $1" >&2
+    echo -e "❌ $1" >&2
 }
 
 # --- Prompt for user inputs ---
@@ -173,4 +173,75 @@ if [ $? -ne 0 ]; then
     exit 1
 else
     echo "SSH connection verified successfully."
+fi
+
+# ========================================================
+# Part 5 - PREPARE REMOTE ENVIRONMENT ---
+# ========================================================
+
+log_info "Preparing remote environment on $SERVER_IP..."
+
+ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" bash <<EOF
+set -e
+
+echo "Updating system packages..."
+sudo apt-get update -y && sudo apt-get upgrade -y
+
+echo "Installing required packages (curl, ca-certificates, gnupg, lsb-release)..."
+sudo apt-get install -y ca-certificates curl gnupg lsb-release
+
+# --- Install Docker if not installed ---
+if ! command -v docker &>/dev/null; then
+    echo "Docker not found. Installing Docker..."
+    curl -fsSL https://get.docker.com | sudo bash
+else
+    echo "Docker already installed."
+fi
+
+# --- Install Docker Compose if not installed ---
+if ! command -v docker-compose &>/dev/null; then
+    echo "Installing Docker Compose..."
+    sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-\$(uname -s)-\$(uname -m)" -o /usr/local/bin/docker-compose
+    sudo chmod +x /usr/local/bin/docker-compose
+else
+    echo "Docker Compose already installed."
+fi
+
+# --- Install nginx if not installed ---
+if ! command -v nginx &>/dev/null; then
+    echo "Installing nginx..."
+    sudo apt-get install -y nginx
+else
+    echo "nginx already installed."
+fi
+
+# --- Add SSH user to docker group ---
+if ! groups $SSH_USER | grep -q docker; then
+    echo "Adding user '$SSH_USER' to docker group..."
+    sudo usermod -aG docker $SSH_USER
+    echo "You may need to log out and back in for this to take effect."
+else
+    echo "User '$SSH_USER' already in docker group."
+fi
+
+# --- Enable and start services ---
+sudo systemctl enable docker
+sudo systemctl start docker
+sudo systemctl enable nginx
+sudo systemctl start nginx
+
+# --- Confirm installation versions ---
+echo "Confirming versions..."
+docker --version
+docker-compose --version
+nginx -v
+
+echo "Remote environment setup complete."
+EOF
+
+if [[ $? -ne 0 ]]; then
+    log_error " Failed to prepare remote environment on $SERVER_IP."
+    exit 1
+else
+    log_info " Remote environment prepared successfully!"
 fi
