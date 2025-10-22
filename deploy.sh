@@ -83,6 +83,7 @@ echo "Server IP:        $SERVER_IP"
 echo "SSH User:         $SSH_USER"
 echo "SSH Key Path:     $SSH_KEY_PATH"
 echo "App Port:         $APP_PORT"
+# echo "GIT PAT:          $GIT_PAT"
 echo ""
 
 # read -rp "Proceed with these settings? (y/n): " CONFIRM
@@ -104,7 +105,8 @@ WORK_DIR="$HOME/deployment/$REPO_NAME"
 mkdir -p "$(dirname "$WORK_DIR")"
 
 # Authenticated URL (PAT safely embedded)
-AUTH_REPO_URL=$(echo "$GIT_REPO_URL" | sed "s#https://#https://$GIT_PAT:@#")
+GIT_USERNAME=$(echo "$GIT_REPO_URL" | awk -F[/:] '{print $(NF-1)}')
+AUTH_REPO_URL=$(echo "$GIT_REPO_URL" | sed "s#https://#https://$GIT_USERNAME:$GIT_PAT@#")
 if [[ -d "$WORK_DIR/.git" ]]; then
     log_info " Repository already exists. Pulling latest changes..."
     cd "$WORK_DIR"
@@ -144,7 +146,7 @@ log_info " Checking Docker setup in repository..."
 # Check for Docker configuration  files
 if [[ -f "Dockerfile" ]]; then
     log_info " Found Dockerfile - ready for Docker build."
-elif [[ -f "docker-compose.yml" ]]; then
+elif [[ -f "compose.yaml" || -f "compose.yml" || -f "docker-compose.yaml" || -f "docker-compose.yml" ]]; then
     log_info " Found docker-compose.yml - ready for multi-service deployment"
 else
     log_error " No Dockerfile or docker-compose.yml found. Cannot continue deployment."
@@ -152,3 +154,23 @@ else
 fi
 
 log_info " Docker Configuration verified successfully."
+
+# ========================================================
+# Part 4 - SSH INTO REMOTE SERVER AND VERIFY CONNECTION
+# ========================================================
+echo " Verifying SSH connection to remote server..."
+
+# Validate SSH key exists
+if [ ! -f "$SSH_KEY_PATH" ]; then
+    echo "SSH key ot found at: $SSH_KEY_PATH"
+    exit 1
+fi
+
+# Test SSH connection (non-interactive)
+ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no -o BatchMode=yes "$SSH_USER@$SERVER_IP" "echo 'SSH connection successful!'" >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    echo "Unable to connect to remote server via SSH. Please verify credentials, key permissions, and IP address."
+    exit 1
+else
+    echo "SSH connection verified successfully."
+fi
