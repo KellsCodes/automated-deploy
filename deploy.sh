@@ -1,27 +1,44 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# --- Create logs directory first ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="$SCRIPT_DIR/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/deploy_$(date +'%Y%m%d_%H%M%S').log"
+
+# --- Logging functions ---
+log_info()    { echo -e "\033[1;34m[INFO]\033[0m $1"    | tee -a "$LOG_FILE"; }
+log_success() { echo -e "\033[1;32m[SUCCESS]\033[0m $1" | tee -a "$LOG_FILE"; }
+log_warn()    { echo -e "\033[1;33m[WARN]\033[0m $1"    | tee -a "$LOG_FILE"; }
+log_error()   { echo -e "\033[1;31m[ERROR]\033[0m $1"   | tee -a "$LOG_FILE"; }
+
+# --- Error trapping ---
+trap 'handle_error $? $LINENO' ERR
+handle_error() {
+    local exit_code=$1
+    local line_no=$2
+    log_error " Script failed at line $line_no (exit code: $exit_code)"
+    log_error " Deployment aborted. Check $LOG_FILE for details."
+    exit "$exit_code"
+}
+
+EXIT_OK=0
+EXIT_SSH_FAIL=10
+EXIT_DOCKER_FAIL=20
+EXIT_NGINX_FAIL=30
+EXIT_UNKNOWN=99
+
+log_info " Deployment started at $(date)"
+log_info " Logs will be saved to: $LOG_FILE"
 
 # ===========================
 # Automated Docker Deployment Script
 # Part 1: User Input Collection
 # ===========================
 
-# Handle unexpected errors
-trap 'echo "An unexpected error occurred on line $LINENO"; exit 1' ERR
-
-echo "Starting Automated Docker Deployment..."
-echo "........................................"
-
-# --- Helper functions ---
-log_info() {
-    echo -e "ℹ️ $1"
-}
-
-log_error() {
-    echo -e "❌ $1" >&2
-}
-
-# --- Prompt for user inputs ---
+log_info "Collecting deployment parameters from user..."
 
 # Git Repository URL
 while [[ -z "${GIT_REPO_URL:-}" ]]; do
@@ -116,19 +133,18 @@ if [[ -d "$WORK_DIR/.git" ]]; then
     git checkout "$GIT_BRANCH"
     git pull origin "$GIT_BRANCH" || {
         log_error " Failed to pull latest changes from $GIT_BRANCH"
-        exit 1
+        exit $EXIT_UNKNOWN
     }
 else
     log_info " Cloning repository into $WORK_DIR..."
     git clone --branch "$GIT_BRANCH" "$AUTH_REPO_URL" "$WORK_DIR" || {
         log_error " Failed to clone repository. Please check your URL or PAT"
-        exit 1
+        exit $EXIT_UNKNOWN
     }
     cd "$WORK_DIR"
 fi
 
-log_info " Repository is ready at: $WORK_DIR"
-echo "......................................."
+log_success " Repository is ready at: $WORK_DIR"
 
 # ==========================
 # Part 3: Verify Docker Setup
@@ -138,19 +154,19 @@ log_info " Navigating into the cloned directory"
 # Ensure work_dir is the correct directory
 cd "$WORK_DIR" || {
     log_error " Failed to enter repository directory: $WORK_DIR"
-    exit 1
+    exit $EXIT_UNKNOWN
 }
 
 log_info " Checking Docker setup in repository..."
 
 # Check for Docker configuration  files
 if [[ -f "Dockerfile" ]]; then
-    log_info " Found Dockerfile - ready for Docker build."
+    log_success " Found Dockerfile - ready for Docker build."
 elif [[ -f "compose.yaml" || -f "compose.yml" || -f "docker-compose.yaml" || -f "docker-compose.yml" ]]; then
-    log_info " Found docker-compose.yml - ready for multi-service deployment"
+    log_success " Found docker-compose.yml - ready for multi-service deployment"
 else
     log_error " No Dockerfile or docker-compose.yml found. Cannot continue deployment."
-    exit 1
+    exit $EXIT_UNKNOWN
 fi
 
 log_info " Docker Configuration verified successfully."
@@ -158,21 +174,21 @@ log_info " Docker Configuration verified successfully."
 # ========================================================
 # Part 4 - SSH INTO REMOTE SERVER AND VERIFY CONNECTION
 # ========================================================
-echo " Verifying SSH connection to remote server..."
+log_info " Verifying SSH connection to remote server..."
 
 # Validate SSH key exists
 if [ ! -f "$SSH_KEY_PATH" ]; then
-    echo "SSH key ot found at: $SSH_KEY_PATH"
-    exit 1
+    log_error "SSH key not found at: $SSH_KEY_PATH"
+    exit $EXIT_SSH_FAIL
 fi
 
 # Test SSH connection (non-interactive)
 ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no -o BatchMode=yes "$SSH_USER@$SERVER_IP" "echo 'SSH connection successful!'" >/dev/null 2>&1
 if [ $? -ne 0 ]; then
-    echo "Unable to connect to remote server via SSH. Please verify credentials, key permissions, and IP address."
-    exit 1
+    log_error "Unable to connect to remote server via SSH. Please verify credentials, key permissions, and IP address."
+    exit $EXIT_SSH_FAIL
 else
-    echo "SSH connection verified successfully."
+    log_success "SSH connection verified successfully."
 fi
 
 
@@ -214,10 +230,10 @@ ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" bash -
 EOF
 
 if [[ $? -eq 0 ]]; then
-    log_info " Idempotent checks completed. Safe to redeploy."
+    log_success " Idempotent checks completed. Safe to redeploy."
 else
     log_error " Idempotent check failed during remote execution."
-    exit 1
+    exit $EXIT_UNKNOWN
 fi
 
 
@@ -287,9 +303,9 @@ EOF
 
 if [[ $? -ne 0 ]]; then
     log_error " Failed to prepare remote environment on $SERVER_IP."
-    exit 1
+    exit $EXIT_UNKNOWN
 else
-    log_info " Remote environment prepared successfully!"
+    log_success " Remote environment prepared successfully!"
 fi
 
 
@@ -308,7 +324,7 @@ REMOTE_APP_DIR="/home/$SSH_USER/app"
 # --- Verify cloned repo exists locally ---
 if [[ ! -d "$CLONE_DIR" ]]; then
     log_error "Local cloned directory not found at: $CLONE_DIR"
-    exit 1
+    exit $EXIT_UNKNOWN
 fi
 
 # --- Step 1: Transfer project files to remote server ---
@@ -320,9 +336,9 @@ rsync -avz -e "ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no" \
 
 if [[ $? -ne 0 ]]; then
     log_error "File transfer to remote server failed."
-    exit 1
+    exit $EXIT_UNKNOWN
 else
-    log_info "Project files transferred successfully."
+    log_success "Project files transferred successfully."
 fi
 
 # --- Step 2: Build and run containers remotely ---
@@ -368,7 +384,7 @@ if [[ $? -ne 0 ]]; then
     log_error " Deployment failed on $SERVER_IP."
     exit 1
 else
-    log_info " Deployment completed successfully!"
+    log_success " Deployment completed successfully!"
 fi
 
 
@@ -428,7 +444,7 @@ NGINX_ENABLED_PATH="/etc/nginx/sites-enabled/app_proxy"
 scp -i "$SSH_KEY_PATH" "$TMP_NGINX_CONF" "$SSH_USER@$SERVER_IP:/tmp/app_proxy.conf" >/dev/null 2>&1 || {
   log_error "Failed to upload nginx config to remote host."
   rm -f "$TMP_NGINX_CONF"
-  exit 1
+  exit $EXIT_NGINX_FAIL
 }
 
 rm -f "$TMP_NGINX_CONF"
@@ -475,11 +491,11 @@ echo "Nginx reverse proxy configured"
 REMOTE_EOF
 
 if [[ $? -eq 0 ]]; then
-  log_info " Nginx reverse proxy configured successfully!"
+  log_success " Nginx reverse proxy configured successfully!"
   log_info "Access your app at: http://$SERVER_IP (or http://$DOMAIN_NAME)"
 else
   log_error " Failed to configure Nginx reverse proxy."
-  exit 1
+  exit $EXIT_NGINX_FAIL
 fi
 
 
@@ -495,14 +511,14 @@ if ssh -i "$SSH_KEY_PATH" "$SSH_USER@$SERVER_IP" "systemctl is-active --quiet do
   log_info " Docker service is active."
 else
   log_error " Docker service is not running!"
-  exit 1
+  exit $EXIT_DOCKER_FAIL
 fi
 
 # 2. Verify running containers
 log_info "Checking for running containers..."
 ssh -i "$SSH_KEY_PATH" "$SSH_USER@$SERVER_IP" "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'" || {
   log_error " Failed to list containers!"
-  exit 1
+  exit $EXIT_DOCKER_FAIL
 }
 
 # 3. Confirm Nginx is active
@@ -510,14 +526,14 @@ if ssh -i "$SSH_KEY_PATH" "$SSH_USER@$SERVER_IP" "systemctl is-active --quiet ng
   log_info " Nginx service is active."
 else
   log_error " Nginx service is not running!"
-  exit 1
+  exit $EXIT_NGINX_FAIL
 fi
 
 # 4. Test Nginx reverse proxy locally (inside EC2)
 log_info "Testing Nginx proxy locally..."
 ssh -i "$SSH_KEY_PATH" "$SSH_USER@$SERVER_IP" "curl -I http://localhost" || {
   log_error " Local Nginx test failed!"
-  exit 1
+  exit $EXIT_NGINX_FAIL
 }
 
 # 5. Test app accessibility remotely (from your local machine)
@@ -559,10 +575,10 @@ if [[ "$CLEANUP_MODE" == true ]]; then
 EOF
 
     if [[ $? -eq 0 ]]; then
-        log_info " Cleanup completed successfully."
-        exit 0
+        log_success " Cleanup completed successfully."
+        exit $EXIT_OK
     else
         log_error " Cleanup failed during remote execution."
-        exit 1
+        exit $EXIT_UNKNOWN
     fi
 fi
