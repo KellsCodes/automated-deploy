@@ -245,3 +245,82 @@ if [[ $? -ne 0 ]]; then
 else
     log_info " Remote environment prepared successfully!"
 fi
+
+
+# ==========================================
+# Part 6 - DEPLOY THE DOCKERIZED APPLICATION
+# ==========================================
+
+log_info "Deploying the Dockerized application to remote server..."
+
+# --- Define directories ---
+CLONE_DIR="$HOME/deployment/$(basename -s .git "$GIT_REPO_URL")"
+
+# Remote deployment directory
+REMOTE_APP_DIR="/home/$SSH_USER/app"
+
+# --- Verify cloned repo exists locally ---
+if [[ ! -d "$CLONE_DIR" ]]; then
+    log_error "Local cloned directory not found at: $CLONE_DIR"
+    exit 1
+fi
+
+# --- Step 1: Transfer project files to remote server ---
+log_info "Transferring project files to $SERVER_IP..."
+
+rsync -avz -e "ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no" \
+    --exclude '.git' --exclude 'node_modules' --exclude '.env' \
+    "$CLONE_DIR/" "$SSH_USER@$SERVER_IP:$REMOTE_APP_DIR" >/dev/null 2>&1
+
+if [[ $? -ne 0 ]]; then
+    log_error "File transfer to remote server failed."
+    exit 1
+else
+    log_info "✅ Project files transferred successfully."
+fi
+
+# --- Step 2: Build and run containers remotely ---
+log_info "Building and running Docker containers on $SERVER_IP..."
+
+ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" bash <<EOF
+set -e
+
+cd $REMOTE_APP_DIR
+
+# --- Detect Docker configuration ---
+if [[ -f "docker-compose.yml" ]]; then
+    echo "🧩 docker-compose.yml found. Starting with Docker Compose..."
+    sudo docker-compose pull
+    sudo docker-compose build
+    sudo docker-compose up -d
+elif [[ -f "Dockerfile" ]]; then
+    echo "🐳 Dockerfile found. Building and running manually..."
+    APP_NAME=\$(basename \$(pwd))
+    sudo docker build -t \$APP_NAME .
+    sudo docker run -d -p $APP_PORT:$APP_PORT --name \$APP_NAME \$APP_NAME
+else
+    echo "❌ No Dockerfile or docker-compose.yml found in project directory."
+    exit 1
+fi
+
+# --- Step 3: Validate container health ---
+echo "🔍 Checking running containers..."
+sudo docker ps
+
+# --- Step 4: Verify app is accessible on the specified port ---
+echo "🌐 Validating application accessibility on port $APP_PORT..."
+sleep 5
+if curl -s "http://localhost:$APP_PORT" >/dev/null; then
+    echo "✅ Application is running and accessible on port $APP_PORT!"
+else
+    echo "⚠️  Application did not respond on port $APP_PORT. Check container logs."
+    sudo docker logs \$(sudo docker ps -q --latest)
+fi
+EOF
+
+if [[ $? -ne 0 ]]; then
+    log_error "Deployment failed on $SERVER_IP."
+    exit 1
+else
+    log_info "✅ Deployment completed successfully!"
+fi
